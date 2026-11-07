@@ -1,0 +1,380 @@
+#pragma once
+#include <string>
+#include <vector>
+#include <sstream>
+
+// ---- Модели ----
+struct Movie {
+    int id;
+    std::string title;
+    std::string genre;
+};
+
+struct Session {
+    int id;
+    int movie_id;
+    std::string date;   // "2025-06-01"
+    std::string time;   // "18:30"
+    int hall_rows = 5;
+    int hall_cols = 8;
+};
+
+struct Booking {
+    int id;
+    int user_id;
+    int session_id;
+    int row, seat;
+    bool active = true;
+};
+
+// ---- Простой протокол: "ACTION|arg1|arg2|..." ----
+inline std::vector<std::string> split(const std::string& s, char d = '|') {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, d)) out.push_back(item);
+    return out;
+}
+
+inline std::string join(const std::vector<std::string>& v, char d = '|') {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) out += d;
+        out += v[i];
+    }
+    return out;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include "common.h"
+#include <iostream>
+#include <fstream>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+// ================== ГЛОБАЛЬНОЕ СОСТОЯНИЕ ==================
+std::mutex g_mtx;                 // защита всех данных
+std::vector<Movie>   g_movies;
+std::vector<Session> g_sessions;
+std::vector<Booking> g_bookings;
+int g_next_movie = 1, g_next_session = 1, g_next_booking = 1;
+
+// ================== СОХРАНЕНИЕ / ЗАГРУЗКА ==================
+void save_data() {
+    std::ofstream f("data.txt");
+    for (auto& m : g_movies)
+        f << "M|" << m.id << "|" << m.title << "|" << m.genre << "\n";
+    for (auto& s : g_sessions)
+        f << "S|" << s.id << "|" << s.movie_id << "|" << s.date << "|"
+          << s.time << "|" << s.hall_rows << "|" << s.hall_cols << "\n";
+    for (auto& b : g_bookings)
+        f << "B|" << b.id << "|" << b.user_id << "|" << b.session_id << "|"
+          << b.row << "|" << b.seat << "|" << (b.active ? 1 : 0) << "\n";
+}
+
+void load_data() {
+    std::ifstream f("data.txt");
+    std::string line;
+    while (std::getline(f, line)) {
+        auto p = split(line);
+        if (p.empty()) continue;
+        if (p[0] == "M") {
+            g_movies.push_back({std::stoi(p[1]), p[2], p[3]});
+            g_next_movie = std::max(g_next_movie, std::stoi(p[1]) + 1);
+        } else if (p[0] == "S") {
+            g_sessions.push_back({std::stoi(p[1]), std::stoi(p[2]), p[3], p[4],
+                                  std::stoi(p[5]), std::stoi(p[6])});
+            g_next_session = std::max(g_next_session, std::stoi(p[1]) + 1);
+        } else if (p[0] == "B") {
+            g_bookings.push_back({std::stoi(p[1]), std::stoi(p[2]), std::stoi(p[3]),
+                                  std::stoi(p[4]), std::stoi(p[5]), p[6] == "1"});
+            g_next_booking = std::max(g_next_booking, std::stoi(p[1]) + 1);
+        }
+    }
+}
+
+// ================== БИЗНЕС-ЛОГИКА ==================
+// Возвращает строку-ответ клиенту
+std::string handle(const std::string& request, int user_id /* -1 = не вошёл */) {
+    auto p = split(request);
+    if (p.empty()) return "ERROR|Неизвестная команда";
+
+    std::lock_guard<std::mutex> lock(g_mtx);
+    std::string cmd = p[0];
+
+    // ---------- Просмотр (доступно всем) ----------
+    if (cmd == "MOVIES") {
+        std::string out = "OK";
+        for (auto& m : g_movies)
+            out += "|" + std::to_string(m.id) + ":" + m.title + ":" + m.genre;
+        return out;
+    }
+
+    if (cmd == "SESSIONS") {
+        int movie_id = std::stoi(p[1]);
+        std::string out = "OK";
+        for (auto& s : g_sessions) {
+            if (s.movie_id != movie_id) continue;
+            out += "|" + std::to_string(s.id) + ":" + s.date + ":" + s.time +
+                   ":" + std::to_string(s.hall_rows) + "x" + std::to_string(s.hall_cols);
+        }
+        return out;
+    }
+
+    if (cmd == "SEATS") {
+        int sid = std::stoi(p[1]);
+        Session* ses = nullptr;
+        for (auto& s : g_sessions) if (s.id == sid) ses = &s;
+        if (!ses) return "ERROR|Сеанс не найден";
+
+        // Формируем карту: 0 = свободно, 1 = занято
+        std::vector<std::vector<int>> grid(ses->hall_rows,
+                                           std::vector<int>(ses->hall_cols, 0));
+        for (auto& b : g_bookings)
+            if (b.session_id == sid && b.active)
+                grid[b.row][b.seat] = 1;
+
+        std::string out = "OK";
+        for (int r = 0; r < ses->hall_rows; ++r) {
+            std::string line;
+            for (int c = 0; c < ses->hall_cols; ++c)
+                line += (grid[r][c] ? "X" : ".");
+            out += "|" + line;
+        }
+        return out;
+    }
+
+    // ---------- Требуют входа ----------
+    if (user_id < 0) return "ERROR|Сначала войдите (LOGIN|имя)";
+
+    if (cmd == "BOOK") {
+        int sid  = std::stoi(p[1]);
+        int row  = std::stoi(p[2]);
+        int seat = std::stoi(p[3]);
+
+        // Проверка границ зала
+        Session* ses = nullptr;
+        for (auto& s : g_sessions) if (s.id == sid) ses = &s;
+        if (!ses) return "ERROR|Сеанс не найден";
+        if (row < 0 || row >= ses->hall_rows || seat < 0 || seat >= ses->hall_cols)
+            return "ERROR|Место вне зала";
+
+        // ГЛАВНАЯ ПРОВЕРКА: не занято ли место
+        for (auto& b : g_bookings)
+            if (b.session_id == sid && b.row == row && b.seat == seat && b.active)
+                return "ERROR|Место уже занято";
+
+        Booking nb{g_next_booking++, user_id, sid, row, seat, true};
+        g_bookings.push_back(nb);
+        save_data();
+        return "OK|Бронь №" + std::to_string(nb.id) + " создана";
+    }
+
+    if (cmd == "MYBOOKINGS") {
+        std::string out = "OK";
+        for (auto& b : g_bookings) {
+            if (b.user_id != user_id || !b.active) continue;
+            out += "|№" + std::to_string(b.id) +
+                   " сеанс " + std::to_string(b.session_id) +
+                   " место (" + std::to_string(b.row) + "," + std::to_string(b.seat) + ")";
+        }
+        return out;
+    }
+
+    if (cmd == "CANCEL") {
+        int bid = std::stoi(p[1]);
+        for (auto& b : g_bookings) {
+            if (b.id == bid && b.user_id == user_id && b.active) {
+                b.active = false;
+                save_data();
+                return "OK|Бронь отменена";
+            }
+        }
+        return "ERROR|Бронь не найдена";
+    }
+
+    return "ERROR|Неизвестная команда";
+}
+
+// ================== СЕТЬ ==================
+std::string recv_line(int fd) {
+    std::string buf;
+    char c;
+    while (recv(fd, &c, 1, 0) == 1) {
+        if (c == '\n') break;
+        buf += c;
+    }
+    return buf;
+}
+
+void send_line(int fd, const std::string& s) {
+    std::string m = s + "\n";
+    send(fd, m.c_str(), m.size(), 0);
+}
+
+void client_thread(int fd) {
+    int user_id = -1;   // -1 = гость, >=1 = авторизован (для лабы id = номер)
+    std::string line;
+    while (!(line = recv_line(fd)).empty()) {
+        // Простейшая "авторизация": LOGIN|имя → user_id = хеш от имени
+        auto p = split(line);
+        if (p[0] == "LOGIN") {
+            user_id = std::hash<std::string>{}(p.size() > 1 ? p[1] : "guest") % 100000 + 1;
+            send_line(fd, "OK|Вы вошли, ваш id " + std::to_string(user_id));
+            continue;
+        }
+        if (p[0] == "QUIT") break;
+
+        send_line(fd, handle(line, user_id));
+    }
+    close(fd);
+}
+
+int main() {
+    load_data();
+
+    // Стартовые данные, если файла не было
+    if (g_movies.empty()) {
+        g_movies.push_back({g_next_movie++, "Интерстеллар", "фантастика"});
+        g_movies.push_back({g_next_movie++, "Матрица", "боевик"});
+        g_sessions.push_back({g_next_session++, 1, "2025-06-01", "18:30", 5, 8});
+        g_sessions.push_back({g_next_session++, 2, "2025-06-01", "21:00", 5, 8});
+        save_data();
+    }
+
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(5555);
+    bind(srv, (sockaddr*)&addr, sizeof(addr));
+    listen(srv, 10);
+
+    std::cout << "Сервер запущен на порту 5555\n";
+
+    while (true) {
+        int fd = accept(srv, nullptr, nullptr);
+        if (fd < 0) continue;
+        std::thread(client_thread, fd).detach();   // поток на клиента
+    }
+}
+
+
+
+
+
+
+
+
+
+
+#include "common.h"
+#include <iostream>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+int sock_fd;
+
+std::string send_recv(const std::string& req) {
+    std::string m = req + "\n";
+    send(sock_fd, m.c_str(), m.size(), 0);
+
+    std::string buf;
+    char c;
+    while (recv(sock_fd, &c, 1, 0) == 1) {
+        if (c == '\n') break;
+        buf += c;
+    }
+    return buf;
+}
+
+int main() {
+    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(5555);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+
+    if (connect(sock_fd, (sockaddr*)&a, sizeof(a)) < 0) {
+        std::cout << "Не удалось подключиться\n";
+        return 1;
+    }
+    std::cout << "Подключено к серверу\n";
+
+    std::string name;
+    std::cout << "Ваше имя: ";
+    std::cin >> name;
+    std::cout << send_recv("LOGIN|" + name) << "\n";
+
+    while (true) {
+        std::cout << "\n1) Фильмы  2) Сеансы  3) Места  4) Бронь  "
+                     "5) Мои брони  6) Отмена  0) Выход\n> ";
+        int cmd; std::cin >> cmd;
+        if (cmd == 0) { send_recv("QUIT"); break; }
+
+        if (cmd == 1) {
+            auto r = send_recv("MOVIES");
+            std::cout << r << "\n";
+        }
+        else if (cmd == 2) {
+            int mid; std::cout << "ID фильма: "; std::cin >> mid;
+            std::cout << send_recv("SESSIONS|" + std::to_string(mid)) << "\n";
+        }
+        else if (cmd == 3) {
+            int sid; std::cout << "ID сеанса: "; std::cin >> sid;
+            auto r = send_recv("SEATS|" + std::to_string(sid));
+            auto parts = split(r);
+            std::cout << "Схема зала (X = занято, . = свободно):\n";
+            for (size_t i = 1; i < parts.size(); ++i) std::cout << parts[i] << "\n";
+        }
+        else if (cmd == 4) {
+            int sid, row, seat;
+            std::cout << "ID сеанса, ряд, место: ";
+            std::cin >> sid >> row >> seat;
+            std::cout << send_recv("BOOK|" + std::to_string(sid) + "|" +
+                                   std::to_string(row) + "|" + std::to_string(seat)) << "\n";
+        }
+        else if (cmd == 5) {
+            std::cout << send_recv("MYBOOKINGS") << "\n";
+        }
+        else if (cmd == 6) {
+            int bid; std::cout << "ID брони: "; std::cin >> bid;
+            std::cout << send_recv("CANCEL|" + std::to_string(bid)) << "\n";
+        }
+    }
+    close(sock_fd);
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+# компиляция (одна команда на каждый бинарник)
+g++ server.cpp -o server -std=c++17 -pthread
+g++ client.cpp -o client -std=c++17 -pthread
